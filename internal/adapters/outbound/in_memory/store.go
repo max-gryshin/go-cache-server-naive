@@ -3,16 +3,20 @@ package in_memory
 import (
 	"container/heap"
 	"context"
+	"hash/fnv"
 	"sync"
 	"time"
 
 	"cache/internal/core/domain"
 )
 
-const evictionInterval = time.Second
+const (
+	evictionInterval = time.Second
+	numShards        = 256
+)
 
-type Store struct {
-	mu        sync.RWMutex
+type shard struct {
+	mu        sync.Mutex
 	data      map[string]domain.CacheEntry
 	expiry    *expiryHeap
 	heapItems map[string]*heapItem
@@ -21,8 +25,8 @@ type Store struct {
 	sizeLimit int64
 }
 
-func NewStore(sizeLimit int64) *Store {
-	return &Store{
+func newShard(sizeLimit int64) *shard {
+	return &shard{
 		data:      make(map[string]domain.CacheEntry),
 		expiry:    newExpiryHeap(),
 		heapItems: make(map[string]*heapItem),
@@ -31,42 +35,69 @@ func NewStore(sizeLimit int64) *Store {
 	}
 }
 
+type Store struct {
+	shards [numShards]*shard
+}
+
+func NewStore(sizeLimit int64) *Store {
+	s := &Store{}
+	perShard := sizeLimit / numShards
+	for i := range s.shards {
+		s.shards[i] = newShard(perShard)
+	}
+	return s
+}
+
+func shardIndex(key string) int {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return int(h.Sum32() & 0xFF)
+}
+
+func (s *Store) getShard(key string) *shard {
+	return s.shards[shardIndex(key)]
+}
+
 func (s *Store) Set(key, value string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.write(key, domain.CacheEntry{Value: value})
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	sh.write(key, domain.CacheEntry{Value: value})
 }
 
 func (s *Store) SetWithTTL(key, value string, ttl time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	expiresAt := time.Now().Add(ttl)
 	entry := domain.CacheEntry{Value: value, ExpiresAt: expiresAt}
-	s.write(key, entry)
+	sh.write(key, entry)
 	item := &heapItem{key: key, expiresAt: expiresAt}
-	heap.Push(s.expiry, item)
-	s.heapItems[key] = item
+	heap.Push(sh.expiry, item)
+	sh.heapItems[key] = item
 }
 
 func (s *Store) Get(key string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entry, ok := s.data[key]
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	entry, ok := sh.data[key]
 	if !ok {
 		return "", false
 	}
 	if entry.IsExpired() {
-		s.delete(key)
+		sh.delete(key)
 		return "", false
 	}
-	s.lru.touch(key)
+	sh.lru.touch(key)
 	return entry.Value, true
 }
 
 func (s *Store) Remove(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.delete(key)
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	sh.delete(key)
 }
 
 func (s *Store) StartEviction(ctx context.Context) {
@@ -78,86 +109,84 @@ func (s *Store) StartEviction(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.evictExpired()
+				var wg sync.WaitGroup
+				for _, sh := range s.shards {
+					wg.Add(1)
+					go func(sh *shard) {
+						defer wg.Done()
+						sh.evictExpired()
+					}(sh)
+				}
+				wg.Wait()
 			}
 		}
 	}()
 }
 
-// write sets a key in the map, updates LRU and size accounting, then
-// evicts LRU entries until the size limit is satisfied.
-// Must be called with s.mu held.
-func (s *Store) write(key string, entry domain.CacheEntry) {
-	if old, exists := s.data[key]; exists {
-		s.sizeUsed -= entrySize(key, old.Value)
-		s.tombstone(key)
+func (sh *shard) write(key string, entry domain.CacheEntry) {
+	if old, exists := sh.data[key]; exists {
+		sh.sizeUsed -= entrySize(key, old.Value)
+		sh.tombstone(key)
 	}
-	s.data[key] = entry
-	s.lru.add(key)
-	s.sizeUsed += entrySize(key, entry.Value)
-	for s.sizeLimit > 0 && s.sizeUsed > s.sizeLimit {
-		s.evictLRU()
+	sh.data[key] = entry
+	sh.lru.add(key)
+	sh.sizeUsed += entrySize(key, entry.Value)
+	for sh.sizeLimit > 0 && sh.sizeUsed > sh.sizeLimit {
+		sh.evictLRU()
 	}
 }
 
-// evictLRU removes the least recently used entry.
-// Must be called with s.mu held.
-func (s *Store) evictLRU() {
-	key := s.lru.evict()
+func (sh *shard) evictLRU() {
+	key := sh.lru.evict()
 	if key == "" {
 		return
 	}
-	entry := s.data[key]
-	s.sizeUsed -= entrySize(key, entry.Value)
-	s.tombstone(key)
-	delete(s.data, key)
+	entry := sh.data[key]
+	sh.sizeUsed -= entrySize(key, entry.Value)
+	sh.tombstone(key)
+	delete(sh.data, key)
 }
 
-// evictExpired pops expired entries from the heap and removes them from the store.
-func (s *Store) evictExpired() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (sh *shard) evictExpired() {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	now := time.Now()
 	for {
-		item := s.expiry.peek()
+		item := sh.expiry.peek()
 		if item == nil {
 			break
 		}
 		if item.deleted {
-			heap.Pop(s.expiry)
+			heap.Pop(sh.expiry)
 			continue
 		}
 		if item.expiresAt.After(now) {
 			break
 		}
-		heap.Pop(s.expiry)
-		entry := s.data[item.key]
-		s.sizeUsed -= entrySize(item.key, entry.Value)
-		s.lru.remove(item.key)
-		delete(s.data, item.key)
-		delete(s.heapItems, item.key)
+		heap.Pop(sh.expiry)
+		entry := sh.data[item.key]
+		sh.sizeUsed -= entrySize(item.key, entry.Value)
+		sh.lru.remove(item.key)
+		delete(sh.data, item.key)
+		delete(sh.heapItems, item.key)
 	}
 }
 
-// delete removes a key from all structures.
-// Must be called with s.mu held.
-func (s *Store) delete(key string) {
-	entry, ok := s.data[key]
+func (sh *shard) delete(key string) {
+	entry, ok := sh.data[key]
 	if !ok {
 		return
 	}
-	s.sizeUsed -= entrySize(key, entry.Value)
-	s.tombstone(key)
-	s.lru.remove(key)
-	delete(s.data, key)
+	sh.sizeUsed -= entrySize(key, entry.Value)
+	sh.tombstone(key)
+	sh.lru.remove(key)
+	delete(sh.data, key)
 }
 
-// tombstone marks the existing heap entry for a key as deleted (if any).
-// Must be called with s.mu held.
-func (s *Store) tombstone(key string) {
-	if item, ok := s.heapItems[key]; ok {
+func (sh *shard) tombstone(key string) {
+	if item, ok := sh.heapItems[key]; ok {
 		item.deleted = true
-		delete(s.heapItems, key)
+		delete(sh.heapItems, key)
 	}
 }
 
